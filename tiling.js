@@ -1,5 +1,4 @@
 import Clutter from 'gi://Clutter';
-import GDesktopEnums from 'gi://GDesktopEnums';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Graphene from 'gi://Graphene';
@@ -14,6 +13,7 @@ import {
 import { Easer, DispatcherMode } from './utils.js';
 import { ClickOverlay } from './stackoverlay.js';
 import { WorkspaceSettings } from './workspace.js';
+import { workAreaToBounds, computeClampedPosition } from './popuputil.js';
 
 const { signals: Signals } = imports;
 const workspaceManager = global.workspace_manager;
@@ -445,6 +445,7 @@ export class Space extends Array {
         this.signals.connect(gsettings, 'changed::use-default-background', this.updateBackground.bind(this));
         this.signals.connect(backgroundSettings, 'changed::picture-uri', this.updateBackground.bind(this));
         this.signals.connect(backgroundSettings, "changed::picture-uri-dark", this.updateBackground.bind(this));
+        this.signals.connect(backgroundSettings, "changed::picture-options", this.updateBackground.bind(this));
     }
 
     /**
@@ -1384,6 +1385,11 @@ export class Space extends Array {
             if (!actor)
                 return;
 
+            // Guard against races with window teardown: an unmanaging window
+            // can crash mutter in meta_window_update_monitor().
+            if (w._paperwmUnmanaging)
+                return;
+
             let placeable = this.isPlaceable(w);
             if (placeable)
                 this.visible.push(w);
@@ -1664,6 +1670,27 @@ border-radius: ${borderWidth}px;
             return;
         }
 
+        // Cancel any in-progress crossfade overlay
+        if (this._bgTransitionActor) {
+            this._bgTransitionActor.remove_all_transitions();
+            if (this._bgTransitionActor.get_parent()) {
+                this.actor.remove_child(this._bgTransitionActor);
+            }
+            this._bgTransitionActor.destroy();
+            this._bgTransitionActor = null;
+            // Explicitly destroy the old background held by the cancelled transition
+            // so its signal connections and timers are cleaned up now rather than
+            // waiting for JS GC to drop the onComplete closure.
+            this._bgTransitionOldBackground?.destroy();
+            this._bgTransitionOldBackground = null;
+        }
+
+        // Cancel any pending (still-loading) background
+        if (this._pendingBackground) {
+            this._pendingBackground.destroy();
+            this._pendingBackground = null;
+        }
+
         let path = this.settings.get_string('background') || Settings.prefs.default_background;
         let useDefault = gsettings.get_boolean('use-default-background');
         if (!path && useDefault) {
@@ -1674,25 +1701,87 @@ border-radius: ${borderWidth}px;
             }
         }
 
-        // destroy old background
-        this.metaBackground?.destroy();
-        this.metaBackground = null;
-
-        this.metaBackground = new Background.Background({
+        const newMetaBackground = new Background.Background({
             monitorIndex: this.monitor.index,
             layoutManager: Main.layoutManager,
             settings: backgroundSettings,
             file: Gio.File.new_for_commandline_arg(path),
-            style: GDesktopEnums.BackgroundStyle.ZOOM,
+            style: backgroundSettings.get_enum('picture-options'),
         });
 
-        this.background.content.set({
-            background: this.metaBackground,
-        });
+        if (!this.metaBackground) {
+            // First load: switch instantly, nothing to crossfade from
+            this.metaBackground = newMetaBackground;
+            this.background.content.set({ background: this.metaBackground });
+            if (this.color) {
+                this.metaBackground.set_color(Utils.color_from_string(this.color)[1]);
+            }
+            return;
+        }
 
-        // after creating new background apply this space's color
-        if (this.color) {
-            this.metaBackground.set_color(Utils.color_from_string(this.color)[1]);
+        // Crossfade: wait for the new image to finish loading, then fade.
+        // Duration and easing match GNOME Shell's own BackgroundManager transition.
+        this._pendingBackground = newMetaBackground;
+
+        const applyTransition = () => {
+            if (this._pendingBackground !== newMetaBackground) return;
+            this._pendingBackground = null;
+
+            if (!this.background) return; // space was destroyed while loading
+
+            const oldMetaBackground = this.metaBackground;
+
+            // Overlay the old background on top so it stays visible during the swap
+            const oldOverlay = new Meta.BackgroundActor(
+                Object.assign({
+                    name: 'old-background-overlay',
+                    monitor: this.monitor.index,
+                }, { meta_display: display })
+            );
+            oldOverlay.set_size(this.width, this.height);
+            oldOverlay.content.set({ background: oldMetaBackground });
+            this.actor.insert_child_above(oldOverlay, this.background);
+
+            // Swap the main background to the new image (hidden under the overlay)
+            this.metaBackground = newMetaBackground;
+            this.background.content.set({ background: this.metaBackground });
+            if (this.color) {
+                this.metaBackground.set_color(Utils.color_from_string(this.color)[1]);
+            }
+
+            // Fade out the old overlay to reveal the new background beneath
+            this._bgTransitionActor = oldOverlay;
+            this._bgTransitionOldBackground = oldMetaBackground;
+            Easer.addEase(oldOverlay, {
+                opacity: 0,
+                duration: 1000,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onComplete: () => {
+                    if (this._bgTransitionActor === oldOverlay) {
+                        this._bgTransitionActor = null;
+                        this._bgTransitionOldBackground = null;
+                    }
+                    if (oldOverlay.get_parent()) {
+                        this.actor.remove_child(oldOverlay);
+                    }
+                    oldOverlay.destroy();
+                    oldMetaBackground.destroy();
+                },
+            });
+        };
+
+        let loadedId = newMetaBackground.connect('loaded', () => {
+            newMetaBackground.disconnect(loadedId);
+            loadedId = 0;
+            applyTransition();
+        });
+        // Image may already be loaded from cache (isLoaded set synchronously)
+        if (newMetaBackground.isLoaded) {
+            if (loadedId) {
+                newMetaBackground.disconnect(loadedId);
+                loadedId = 0;
+            }
+            applyTransition();
         }
     }
 
@@ -1925,6 +2014,13 @@ border-radius: ${borderWidth}px;
             }, { meta_display: display })
         );
 
+        // GNOME 51 assumes a BackgroundActor always has background content
+        // when it is painted. Give it a placeholder before adding it to the
+        // scene; updateBackground() replaces this with the workspace image.
+        const placeholder = new Meta.Background({ meta_display: display });
+        placeholder.set_color(Utils.color_from_string(this.color ?? '#000000')[1]);
+        this.background.content.set({ background: placeholder });
+
         this.actor.insert_child_below(this.background, null);
 
         this.signals.connect(this.background, 'button-press-event',
@@ -2147,6 +2243,12 @@ border-radius: ${borderWidth}px;
         });
         this.signals.destroy();
         this.signals = null;
+        this._pendingBackground?.destroy();
+        this._pendingBackground = null;
+        this._bgTransitionOldBackground?.destroy();
+        this._bgTransitionOldBackground = null;
+        this.metaBackground?.destroy();
+        this.metaBackground = null;
         this.background.destroy();
         this.background = null;
         this.cloneContainer.destroy();
@@ -2214,6 +2316,11 @@ export const Spaces = class Spaces extends Map {
 
         this.signals.connect(display, 'window-created',
             (display, metaWindow, _user_data) => this.window_created(metaWindow));
+
+        this.signals.connect(display, 'window-demands-attention',
+            (_display, metaWindow) => positionPopupOnDemand(metaWindow));
+        this.signals.connect(display, 'window-marked-urgent',
+            (_display, metaWindow) => positionPopupOnDemand(metaWindow));
 
         this.signals.connect(display, 'grab-op-begin', (display, mw, type) => grabBegin(mw, type));
         this.signals.connect(display, 'grab-op-end', (display, mw, type) => grabEnd(mw, type));
@@ -3563,6 +3670,14 @@ export function registerWindow(metaWindow) {
                 period_ms: 100,
                 count: 10,
                 callback: () => {
+                    // The window may be unmanaging by the time this timeout
+                    // fires (e.g. closed during a workspace switch); calling
+                    // into mutter on it can segfault.
+                    if (metaWindow._paperwmUnmanaging || metaWindow.get_compositor_private() === null) {
+                        done(timeout);
+                        return false; // stop the timeout
+                    }
+
                     const f = metaWindow.get_frame_rect();
                     if (metaWindow._targetHeight !== f.height) {
                         if (!isNaN(metaWindow._targetHeight)) {
@@ -3584,6 +3699,12 @@ export function registerWindow(metaWindow) {
         workspaceChangeTimeouts.push(timeout);
     });
 
+    // 'unmanaging' is a signal (not a property) in mutter; mark the window
+    // so async callbacks can skip it instead of crashing in mutter
+    // (meta_window_update_monitor() dereferences torn-down state).
+    signals.connect(metaWindow, 'unmanaging', mw => {
+        mw._paperwmUnmanaging = true;
+    });
     signals.connect(actor, 'destroy', destroyHandler);
     return true;
 }
@@ -3691,6 +3812,12 @@ export function resizeHandler(metaWindow) {
 
     if (inGrab && inGrab.window === metaWindow)
         return;
+
+    // Reached asynchronously (Meta.LaterType.RESIZE); the window may have
+    // started unmanaging in the meantime.
+    if (metaWindow._paperwmUnmanaging || metaWindow.get_compositor_private() === null) {
+        return;
+    }
 
     const space = spaces.spaceOfWindow(metaWindow);
     if (!space) {
@@ -4594,6 +4721,58 @@ export function getDefaultFocusMode() {
 }
 
 // `MetaWindow::focus` handling
+/**
+ * Whether `metaWindow` is popup-class: a real (non-tiled) surface mutter
+ * positions itself — transients and non-NORMAL dialogs/modals, but not sticky
+ * or scratch windows (which have their own positioning). Derived from the
+ * canonical `add_filter` (single source of truth for tiling eligibility) minus
+ * sticky/scratch, so it follows automatically if `add_filter` widens.
+ */
+export function isPopupClass(metaWindow) {
+    if (metaWindow.is_on_all_workspaces() || Scratch.isScratchWindow(metaWindow))
+        return false;
+    return !add_filter(metaWindow);
+}
+
+/**
+ * Reposition a popup-class window fully inside its space's workArea.
+ *
+ * Unlike tiled windows, popups are real MetaWindows positioned by mutter (not
+ * in the clone container), so they can't be scrolled via `ensureViewport`. We
+ * move them directly with `move_frame`. No-op if already fully on-screen.
+ *
+ * Precondition: `metaWindow`'s space agrees with its physical monitor —
+ * cross-workspace popups are redirected by `insertWindow` before this runs.
+ */
+export function ensureVisibleInWorkArea(metaWindow) {
+    const space = spaces.spaceOfWindow(metaWindow);
+    // Bail if the window's physical monitor doesn't match its workspace's space
+    // (can desync on cross-workspace moves) — repositioning from the wrong
+    // monitor's workArea would yank the popup across heads.
+    if (metaWindow.get_monitor() !== space.monitor.index)
+        return;
+    const bounds = workAreaToBounds(space.monitor, space.workArea());
+    const frame = metaWindow.get_frame_rect();
+    const { x, y } = computeClampedPosition(frame, bounds);
+    if (x !== frame.x || y !== frame.y)
+        metaWindow.move_frame(true, x, y);
+}
+
+/**
+ * Make a popup that demanded attention fully visible WITHOUT stealing focus
+ * (focus was denied by mutter's focus-stealing prevention, or never requested).
+ * By design the user's current window keeps focus. Non-popup demands-attention
+ * (a tiled window wanting attention) is left to gnome-shell's default handler.
+ */
+export function positionPopupOnDemand(metaWindow) {
+    // Demands-attention / urgent can fire mid-teardown on a window whose actor
+    // is gone or frame not yet computed — bail before touching it.
+    if (!metaWindow || metaWindow.unmapped || !metaWindow.get_compositor_private())
+        return;
+    if (isPopupClass(metaWindow))
+        ensureVisibleInWorkArea(metaWindow);
+}
+
 export function focus_handler(metaWindow) {
     console.debug("focus:", metaWindow?.title);
     if (Scratch.isScratchWindow(metaWindow)) {
@@ -4603,9 +4782,13 @@ export function focus_handler(metaWindow) {
         return;
     }
 
-    // If metaWindow is a transient window, return (after deselecting tiled focus indicators)
+    // Transient window: it's a real MetaWindow mutter positions itself, not in
+    // the clone container, so ensureViewport can't scroll it. Move it fully
+    // on-screen instead, then bail out of the tiled focus logic (after
+    // deselecting tiled focus indicators).
     if (isTransient(metaWindow)) {
         setAllWorkspacesInactive();
+        ensureVisibleInWorkArea(metaWindow);
         return;
     }
 
@@ -4937,8 +5120,7 @@ export function cycleWindowWidthBackwards(metawindow) {
 export function cycleWindowWidthDirection(metaWindow, direction) {
     let frame = metaWindow.get_frame_rect();
     let space = spaces.spaceOfWindow(metaWindow);
-    let workArea = space.workArea();
-    workArea.x += space.monitor.x;
+    let workArea = workAreaToBounds(space.monitor, space.workArea());
 
     let findFn = direction === CycleWindowSizesDirection.FORWARD ? Lib.findNext : Lib.findPrev;
 
